@@ -45,37 +45,113 @@ def _forward_with_query_dump(
 
 
 class LookAheadSpecWorker(Worker):
+    def _reshape_key_gqa(self, key_tensor: torch.Tensor) -> torch.Tensor:
+        """
+        Reshapes the key tensor for Grouped-Query Attention by dynamically
+        calculating the repeat factor based on the tensor's actual shape
+        and the tensor parallelism size.
+        
+        This method also handles the edge case where the number of KV heads
+        is not divisible by the TP size, in which case we slice the KV tensor.
+        """
+        num_kv_heads_per_worker = key_tensor.shape[1]
+        num_q_heads_total = self.model_runner.model.config.num_attention_heads
+        tp_size = self.parallel_config.tensor_parallel_size
+        num_q_heads_per_worker = num_q_heads_total // tp_size
+
+        # Standard GQA/MHA case where heads are perfectly divisible
+        if num_q_heads_per_worker % num_kv_heads_per_worker == 0:
+            repeats = num_q_heads_per_worker // num_kv_heads_per_worker
+            if repeats == 1:
+                return key_tensor
+            return torch.repeat_interleave(key_tensor, repeats=repeats, dim=1)
+        
+        # This handles the special case where num_total_kv_heads is not
+        # divisible by tp_size. In this scenario, vLLM seems to pad the
+        # KV cache. We assume a 1-to-1 mapping and slice the padded heads
+        # to match the number of query heads on this worker.
+        else:
+            if num_q_heads_per_worker != num_kv_heads_per_worker:
+                 return key_tensor[:, :num_q_heads_per_worker, :]
+            return key_tensor
+
+    def _patch_llama_model(self):
+        """
+        Monkey-patches the Llama model for query dumping and sets up
+        model-specific parameters.
+        """
+        from vllm.model_executor.models.llama import (LlamaAttention,
+                                                      LlamaDecoderLayer)
+
+        for layer_idx, layer in enumerate(self.model_runner.model.model.layers):
+            assert isinstance(layer, LlamaDecoderLayer)
+            layer.self_attn.forward = MethodType(
+                partial(_forward_with_query_dump,
+                        query_buffer=self.query_buffer,
+                        layer_idx=layer_idx), layer.self_attn)
+
+        # Use a lambda to attach model-specific stop token logic.
+        self.get_stop_token_ids = lambda: [128001, 128008, 128009]
+
+        # Use the dynamic GQA reshape method for keys.
+        self._reshape_key = self._reshape_key_gqa
+
+        # Define model-specific reshaping logic, aware of tensor parallelism.
+        num_q_heads_per_worker = (self.model_runner.model.config.num_attention_heads //
+                                  self.parallel_config.tensor_parallel_size)
+        self._reshape_query = lambda x: x.reshape(
+            -1, num_q_heads_per_worker,
+            self.model_runner.model.config.head_dim)
+
+    def _patch_qwen_model(self):
+        """
+        Monkey-patches the Qwen model for query dumping and sets up
+        model-specific parameters.
+        """
+        # The forward function for Qwen2Attention in vLLM is compatible with
+        # Llama's for our query dumping purposes, so we can reuse the hook.
+        from vllm.model_executor.models.qwen2 import Qwen2DecoderLayer
+
+        for layer_idx, layer in enumerate(self.model_runner.model.model.layers):
+            assert isinstance(layer, Qwen2DecoderLayer)
+            layer.self_attn.forward = MethodType(
+                partial(_forward_with_query_dump,
+                        query_buffer=self.query_buffer,
+                        layer_idx=layer_idx), layer.self_attn)
+
+        # Qwen1.5 / Qwen2 stop tokens
+        # <|endoftext|>: 151643, <|im_start|>: 151644, <|im_end|>: 151645
+        self.get_stop_token_ids = lambda: [151643, 151644, 151645]
+
+        # Use the dynamic GQA reshape method for keys.
+        self._reshape_key = self._reshape_key_gqa
+
+        # Define model-specific reshaping logic, aware of tensor parallelism.
+        num_q_heads_per_worker = (self.model_runner.model.config.num_attention_heads //
+                                  self.parallel_config.tensor_parallel_size)
+        head_dim = (self.model_runner.model.config.hidden_size //
+                    self.model_runner.model.config.num_attention_heads)
+        self._reshape_query = lambda x: x.reshape(
+            -1, num_q_heads_per_worker, head_dim)
+
     def load_model(self):
         super().load_model()
-        assert isinstance(self.model_runner.model, LlamaForCausalLM)
-        
         self.spec_config = get_spec_config()
 
         self._prepare_query_buffer()
 
-        # do patching here to allow model output attention
-        for layer_idx, layer in enumerate(self.model_runner.model.model.layers):
-            assert isinstance(layer, LlamaDecoderLayer)
-            layer.self_attn.forward = MethodType(
-                partial(
-                    _forward_with_query_dump, 
-                    query_buffer=self.query_buffer, 
-                    layer_idx=layer_idx), 
-                layer.self_attn)
-            
-        self._reshape_key = partial(
-            torch.repeat_interleave, 
-            dim=1, 
-            repeats=(
-                self.model_runner.model.config.num_attention_heads //
-                self.model_runner.model.config.num_key_value_heads
-            ))
-        
-        self._reshape_query = lambda x: x.reshape(
-            -1, 
-            self.model_runner.model.config.num_attention_heads, 
-            self.model_runner.model.config.head_dim
-        )
+        # Dispatch to the correct model patcher based on model type.
+        # This makes it extensible to other models like Qwen.
+        from vllm.model_executor.models.llama import LlamaForCausalLM
+        from vllm.model_executor.models.qwen2 import Qwen2ForCausalLM
+        if isinstance(self.model_runner.model, LlamaForCausalLM):
+            self._patch_llama_model()
+        elif isinstance(self.model_runner.model, Qwen2ForCausalLM):
+            self._patch_qwen_model()
+        else:
+            raise NotImplementedError(
+                f"Speculative prefill is not supported for model type "
+                f"{type(self.model_runner.model).__name__}")
 
     def _prepare_query_buffer(self):
         if not hasattr(self, "query_buffer"):
@@ -141,7 +217,7 @@ class LookAheadSpecWorker(Worker):
             # assume the same eos ids across requests
             actual_look_ahead_cnts = self._get_actual_look_ahead_cnts(
                 model_outputs, 
-                [128001, 128008, 128009] # hard coded for now
+                self.get_stop_token_ids()
             )
         else:
             actual_look_ahead_cnts = None
@@ -373,54 +449,55 @@ class LookAheadSpecWorker(Worker):
             self.model_runner.model_config.hf_text_config, "num_hidden_layers")
 
     def _get_attention_scores(
-        self, 
-        query_buffer: torch.Tensor, 
+        self,
+        query_buffer: torch.Tensor,
         # because each sample might have diff number of keys
-        key_buffer: List[List[torch.Tensor]], 
-        actual_look_ahead_cnts: List[int], 
+        key_buffer: List[List[torch.Tensor]],
+        actual_look_ahead_cnts: List[int],
     ) -> List[torch.Tensor]:
-        """
-            A caveat or potentially a good design here:
-                For look ahead tokens, we also just attend to context, 
-                not generated tokens
-        """
+        num_samples = len(actual_look_ahead_cnts)
+        num_layers = len(query_buffer)
+        
+        # A list of lists to hold attention scores.
+        # Outer list is for samples, inner list is for layers.
+        all_samples_attn_scores = [[] for _ in range(num_samples)]
 
-        attn_weights = []
+        # Iterate over layers
+        for layer_idx in range(num_layers):
+            # Tensors for the current layer
+            q_for_layer = query_buffer[layer_idx]
+            k_for_layer = key_buffer[layer_idx]  # This is a list of tensors
 
-        # first lets get the queries out from query_buffer
-        for layer_idx in range(len(query_buffer)):
-            attn_weights.append([])
+            # Split the query tensor along the sample dimension
+            # Note: q_for_layer shape is (look_ahead_cnt, num_samples, hidden_size)
+            # After split, each element is (look_ahead_cnt, 1, hidden_size)
+            q_per_sample = torch.split(q_for_layer, 1, dim=1)
 
-            keys = key_buffer[layer_idx]
-            queries = query_buffer[layer_idx]
-            queries = torch.split(
-                queries, 
-                split_size_or_sections=1, 
-                dim=1)
-            
-            for q, k, c in zip(queries, keys, actual_look_ahead_cnts):
-                # (len, num_heads, head_dim)
-                query = self._reshape_query(q).transpose(0, 1)
-                key = self._reshape_key(k).transpose(0, 1)
+            # Iterate over samples for the current layer, handling each one
+            # individually to support variable prompt lengths.
+            for sample_idx, (q_one_sample, k_one_sample) in enumerate(zip(q_per_sample, k_for_layer)):
+                lac = actual_look_ahead_cnts[sample_idx]
                 
-                # take off things if we hit EOS
-                query = query[:, :c, :]
+                # Reshape query and key for a single sample.
+                # q_one_sample has an extra dim of 1, so squeeze it.
+                # print("k_one_sample", k_one_sample.shape)
+                query = self._reshape_query(q_one_sample.squeeze(1)).transpose(0, 1)
+                key = self._reshape_key(k_one_sample).transpose(0, 1)
+                
+                # Slice query based on actual look ahead count for efficiency
+                query = query[:, :lac, :]
 
-                attn = torch.matmul(
-                    query, key.transpose(-1, -2)
-                ) / math.sqrt(query.shape[-1])
+                # Calculate attention scores
+                attn = torch.matmul(query, key.transpose(-1, -2)) / math.sqrt(query.shape[-1])
+                
+                all_samples_attn_scores[sample_idx].append(attn)
 
-                attn_weights[-1].append(attn)
+        # Stack the layer-attentions for each sample to get the final structure.
+        # The result is a list of tensors, where each tensor corresponds to a
+        # sample and has shape [num_layers, num_heads, look_ahead_cnt, context_len].
+        final_attn_scores = [torch.stack(sample_attns, dim=0) for sample_attns in all_samples_attn_scores]
 
-        # reshape -> from [layer, sample, attn] to [sample, layer, attn]
-        reshaped_attn_weights: List[torch.Tensor] = []
-        for sample_idx in range(len(attn_weights[0])):
-            reshaped_attn_weights.append(
-                torch.stack(
-                    [attn_weights[layer_idx][sample_idx] for layer_idx in range(len(attn_weights))], 
-                    dim=0))
-
-        return reshaped_attn_weights
+        return final_attn_scores
 
     def _get_keys_from_slot_mapping(
         self, 
